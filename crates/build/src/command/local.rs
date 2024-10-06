@@ -1,47 +1,97 @@
-use std::{env, process::Command};
-
-use crate::{BuildArgs, HELPER_TARGET_SUBDIR};
+use std::process::{exit, Command, Stdio};
+use anyhow::{Context, Result};
 use cargo_metadata::camino::Utf8PathBuf;
-use dirs::home_dir;
-
+use crate::BuildArgs;
 use super::utils::{get_program_build_args, get_rust_compiler_flags};
 
-/// Get the command to build the program locally.
-pub(crate) fn create_local_command(
+/// Uses SP1_DOCKER_IMAGE environment variable if set, otherwise constructs the image to use based
+/// on the provided tag.
+fn get_docker_image(tag: &str) -> String {
+    std::env::var("SP1_DOCKER_IMAGE").unwrap_or_else(|_| {
+        let image_base = "ghcr.io/succinctlabs/sp1";
+        format!("{}:{}", image_base, tag)
+    })
+}
+
+/// Creates a Docker command to build the program.
+pub(crate) fn create_docker_command(
     args: &BuildArgs,
     program_dir: &Utf8PathBuf,
     program_metadata: &cargo_metadata::Metadata,
-) -> Command {
-    let mut command = Command::new("cargo");
-    let canonicalized_program_dir =
-        program_dir.canonicalize().expect("Failed to canonicalize program directory");
+) -> Result<Command> {
+    let image = get_docker_image(&args.tag);
 
-    // If CC_riscv32im_succinct_zkvm_elf is not set, set it to the default C++ toolchain
-    // downloaded by 'sp1up --c-toolchain'.
-    if env::var("CC_riscv32im_succinct_zkvm_elf").is_err() {
-        if let Some(home_dir) = home_dir() {
-            let cc_path = home_dir.join(".sp1").join("bin").join("riscv32-unknown-elf-gcc");
-            if cc_path.exists() {
-                command.env("CC_riscv32im_succinct_zkvm_elf", cc_path);
-            }
-        }
+    let canonicalized_program_dir: Utf8PathBuf = program_dir
+        .canonicalize()
+        .context("Failed to canonicalize program directory")?
+        .try_into()
+        .context("Failed to convert path")?;
+
+    let workspace_root = &program_metadata.workspace_root;
+
+    // Check if docker is installed and running.
+    let docker_check = Command::new("docker")
+        .args(["info"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .context("failed to run docker command")?;
+    if !docker_check.success() {
+        eprintln!("docker is not installed or not running: https://docs.docker.com/get-docker/");
+        exit(1);
     }
 
-    // When executing the local command:
+    // Mount the entire workspace, and set the working directory to the program dir. 
+    let workspace_root_path = format!("{}:/root/program", workspace_root);
+    let program_dir_path = canonicalized_program_dir
+        .strip_prefix(workspace_root)
+        .map(|p| format!("/root/program/{}", p.to_string_lossy()))
+        .context("Failed to strip prefix from program directory")?;
+
+    // Get the target directory for the ELF in the context of the Docker container.
+    let relative_target_dir = program_metadata
+        .target_directory
+        .strip_prefix(workspace_root)
+        .context("Failed to strip prefix from target directory")?;
+    let target_dir = format!(
+        "/root/program/{}/{}/{}",
+        relative_target_dir,
+        crate::HELPER_TARGET_SUBDIR,
+        "docker"
+    );
+
+    // When executing the Docker command:
     // 1. Set the target directory to a subdirectory of the program's target directory to avoid
-    //    build
-    // conflicts with the parent process. Source: https://github.com/rust-lang/cargo/issues/6412
+    //    build conflicts with the parent process. Source: https://github.com/rust-lang/cargo/issues/6412
     // 2. Set the rustup toolchain to succinct.
     // 3. Set the encoded rust flags.
-    // 4. Remove the rustc configuration, otherwise in a build script it will attempt to compile the
-    //    program with the toolchain of the normal build process, rather than the Succinct
-    //    toolchain.
-    command
-        .current_dir(canonicalized_program_dir)
-        .env("RUSTUP_TOOLCHAIN", "succinct")
-        .env("CARGO_ENCODED_RUSTFLAGS", get_rust_compiler_flags())
-        .env_remove("RUSTC")
-        .env("CARGO_TARGET_DIR", program_metadata.target_directory.join(HELPER_TARGET_SUBDIR))
-        .args(get_program_build_args(args));
-    command
+    // Note: In Docker, you can't use the .env command to set environment variables, you have to use
+    // the -e flag.
+    let mut docker_args = vec![
+        "run".to_string(),
+        "--rm".to_string(),
+        "--platform".to_string(),
+        "linux/amd64".to_string(),
+        "-v".to_string(),
+        workspace_root_path,
+        "-w".to_string(),
+        program_dir_path,
+        "-e".to_string(),
+        format!("CARGO_TARGET_DIR={}", target_dir),
+        "-e".to_string(),
+        "RUSTUP_TOOLCHAIN=succinct".to_string(),
+        "-e".to_string(),
+        format!("CARGO_ENCODED_RUSTFLAGS={}", get_rust_compiler_flags()),
+        "--entrypoint".to_string(),
+        "".to_string(),
+        image,
+        "cargo".to_string(),
+    ];
+
+    // Add the SP1 program build arguments.
+    docker_args.extend_from_slice(&get_program_build_args(args));
+
+    let mut command = Command::new("docker");
+    command.current_dir(&canonicalized_program_dir).args(&docker_args);
+    Ok(command)
 }
